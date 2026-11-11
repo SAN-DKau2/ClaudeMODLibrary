@@ -71,8 +71,18 @@ const fmt = (n: number): string =>
       ? `${(n / 1_000).toFixed(1)}k`
       : String(n)
 
-const line = (t: Totals): string =>
-  `Tokens: ${fmt(t.input + t.cacheRead + t.cacheWrite)} in · ${fmt(t.output)} out`
+const SHORT_NAMES: Record<string, string> = {
+  five_hour: 'Session',
+  seven_day: 'Week',
+  spend_limit: 'Spend',
+}
+
+// The status entry under the prompt: limits first, then tokens.
+const line = (t: Totals, windows: readonly Limit[] = []): string =>
+  [
+    ...windows.map(l => `${SHORT_NAMES[l.kind] ?? l.kind} ${Math.round(l.percentUsed)}%`),
+    `${fmt(t.input + t.cacheRead + t.cacheWrite)} in · ${fmt(t.output)} out`,
+  ].join(' · ')
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
@@ -103,7 +113,7 @@ export const register: Register = on => {
     await update($, limits, () => start)
 
     void $.ui.open({ id: PANE, title: TITLE })
-    $.ui.status(line(await read($, totals)))
+    $.ui.status(line(await read($, totals), start))
     return ran
   })
 
@@ -115,13 +125,15 @@ export const register: Register = on => {
   // Fires after each turn: store the limits and redraw the pane (context
   // and cost are read live while drawing).
   on('session.measure', async ($, e, next) => {
+    let list: Limit[]
     if (e.rateLimits.length) {
-      const list = copyLimits(e.rateLimits)
+      list = copyLimits(e.rateLimits)
       await update($, limits, () => list)
       await $.store.set(LIMITS_KEY, list)
     } else {
-      await update($, limits, l => [...l])
+      list = await update($, limits, l => [...l])
     }
+    $.ui.status(line(await read($, totals), list))
     return next(e)
   })
 
@@ -136,7 +148,7 @@ export const register: Register = on => {
         cacheRead: t.cacheRead + u.cache_read_input_tokens,
         cacheWrite: t.cacheWrite + u.cache_creation_input_tokens,
       }))
-      $.ui.status(line(t))
+      $.ui.status(line(t, await read($, limits)))
 
       const { startedAt } = await $.session.usage()
       await $.store.set(TOTALS_PREFIX + startedAt, t)
@@ -152,25 +164,6 @@ export const register: Register = on => {
   on('session.end', async ($, e, next) => {
     if (e.reason === 'clear') await update($, totals, () => ZERO)
     return next(e)
-  })
-
-  // A compact label in the footer under the prompt, beside the mode labels.
-  on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
-    const t = await read($, totals)
-    const stored: Limit[] = await read($, limits)
-    const live = (await $.session.usage()).rateLimits
-    const windows = live.length ? copyLimits(live) : stored
-    const short: Record<string, string> = {
-      five_hour: 'Session',
-      seven_day: 'Week',
-      spend_limit: 'Spend',
-    }
-    const parts = [
-      ...windows.map(l => `${short[l.kind] ?? l.kind} ${Math.round(l.percentUsed)}%`),
-      `${fmt(t.input + t.cacheRead + t.cacheWrite)} in`,
-      `${fmt(t.output)} out`,
-    ]
-    return next({ ...e, props: { ...e.props, modes: [...e.props.modes, parts.join(' · ')] } })
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
