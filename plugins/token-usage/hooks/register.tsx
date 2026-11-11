@@ -154,6 +154,25 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // A compact label in the footer under the prompt, beside the mode labels.
+  on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
+    const t = await read($, totals)
+    const stored: Limit[] = await read($, limits)
+    const live = (await $.session.usage()).rateLimits
+    const windows = live.length ? copyLimits(live) : stored
+    const short: Record<string, string> = {
+      five_hour: 'Session',
+      seven_day: 'Week',
+      spend_limit: 'Spend',
+    }
+    const parts = [
+      ...windows.map(l => `${short[l.kind] ?? l.kind} ${Math.round(l.percentUsed)}%`),
+      `${fmt(t.input + t.cacheRead + t.cacheWrite)} in`,
+      `${fmt(t.output)} out`,
+    ]
+    return next({ ...e, props: { ...e.props, modes: [...e.props.modes, parts.join(' · ')] } })
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     const t = await read($, totals)
