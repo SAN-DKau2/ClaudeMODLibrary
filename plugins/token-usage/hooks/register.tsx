@@ -1,31 +1,43 @@
 import { atom, read, update } from 'claude-code'
-import type { Register, SessionRateLimit } from 'claude-code'
+import type { Register, SessionRateLimit, StateDollar } from 'claude-code'
 
 import type { Limit, Totals } from '../types'
 
 const PANE = 'token-usage'
 const TITLE = 'Token usage'
 const ZERO: Totals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+const REFRESH_MS = 2 * 60 * 1000
 const LIMITS_KEY = 'lastLimits'
 // Totals are saved per session, keyed by when it began, so a restart or a
 // resumed session picks up where it left off. Only the newest few are kept.
 const TOTALS_PREFIX = 'totals:'
 const KEEP_SESSIONS = 20
 
-// Kept in session state so writing it redraws the pane.
+// Session state: writing any of these redraws what reads it.
 const totals = atom({ plugin: 'token-usage', key: 'totals' } as const, ZERO, {
   shape: 'totals-1',
 })
-
-// The account's rate-limit windows, as last reported.
 const limits = atom({ plugin: 'token-usage', key: 'limits' } as const, [], {
   shape: 'limits-1',
 })
+const limitsAt = atom({ plugin: 'token-usage', key: 'limitsAt' } as const, 0)
+const tick = atom({ plugin: 'token-usage', key: 'tick' } as const, 0)
+
+// The slice of `$` the status refresh uses, from a hook or the timer.
+type StatusDollar = StateDollar & {
+  clock: { now: () => Promise<number> }
+  ui: { status: (text: string | undefined) => void }
+}
 
 const LIMIT_NAMES: Record<string, string> = {
   five_hour: 'Current session',
   seven_day: 'Weekly limit',
   spend_limit: 'Spend limit',
+}
+const SHORT_NAMES: Record<string, string> = {
+  five_hour: 'Session',
+  seven_day: 'Week',
+  spend_limit: 'Spend',
 }
 
 const isTotals = (v: unknown): v is Totals =>
@@ -44,6 +56,16 @@ const isLimits = (v: unknown): v is Limit[] =>
       typeof l.kind === 'string' &&
       typeof l.percentUsed === 'number',
   )
+
+// What the store holds under LIMITS_KEY: `{ list, at }`, or a bare list from 0.2/0.3.
+const readSavedLimits = (v: unknown): { list: Limit[]; at: number } => {
+  if (isLimits(v)) return { list: v, at: 0 }
+  if (typeof v === 'object' && v !== null) {
+    const o = v as { list?: unknown; at?: unknown }
+    if (isLimits(o.list)) return { list: o.list, at: typeof o.at === 'number' ? o.at : 0 }
+  }
+  return { list: [], at: 0 }
+}
 
 const copyLimits = (list: readonly SessionRateLimit[]): Limit[] =>
   list.map(l => ({ kind: l.kind, percentUsed: l.percentUsed, resetsAt: l.resetsAt }))
@@ -64,6 +86,15 @@ const resets = (iso?: string): string => {
   return `Resets ${sameDay ? '' : days[d.getDay()] + ' '}${hh}:${mm}`
 }
 
+// How long ago the limits were reported: "now", "4m ago", "1h 12m ago".
+const age = (at: number, now: number): string => {
+  if (!at) return ''
+  const mins = Math.floor(Math.max(0, now - at) / 60_000)
+  if (mins < 1) return 'now'
+  if (mins < 60) return `${mins}m ago`
+  return `${Math.floor(mins / 60)}h ${mins % 60}m ago`
+}
+
 const fmt = (n: number): string =>
   n >= 1_000_000
     ? `${(n / 1_000_000).toFixed(1)}M`
@@ -71,18 +102,23 @@ const fmt = (n: number): string =>
       ? `${(n / 1_000).toFixed(1)}k`
       : String(n)
 
-const SHORT_NAMES: Record<string, string> = {
-  five_hour: 'Session',
-  seven_day: 'Week',
-  spend_limit: 'Spend',
+// The status entry under the prompt: limits and their age, then tokens.
+const showStatus = async ($: StatusDollar): Promise<void> => {
+  const t = await read($, totals)
+  const windows: Limit[] = await read($, limits)
+  const when = age(await read($, limitsAt), await $.clock.now())
+  const limitText = windows
+    .map(l => `${SHORT_NAMES[l.kind] ?? l.kind} ${Math.round(l.percentUsed)}%`)
+    .join(' · ')
+  $.ui.status(
+    [
+      limitText && (when ? `${limitText} (${when})` : limitText),
+      `${fmt(t.input + t.cacheRead + t.cacheWrite)} in · ${fmt(t.output)} out`,
+    ]
+      .filter(Boolean)
+      .join(' · '),
+  )
 }
-
-// The status entry under the prompt: limits first, then tokens.
-const line = (t: Totals, windows: readonly Limit[] = []): string =>
-  [
-    ...windows.map(l => `${SHORT_NAMES[l.kind] ?? l.kind} ${Math.round(l.percentUsed)}%`),
-    `${fmt(t.input + t.cacheRead + t.cacheWrite)} in · ${fmt(t.output)} out`,
-  ].join(' · ')
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
@@ -93,6 +129,7 @@ export const register: Register = on => {
     })
 
     const usage = await $.session.usage()
+    const now = await $.clock.now()
 
     // Totals: what this session saved before a restart, unless the live
     // state (kept across a mod reload) already holds more.
@@ -104,16 +141,24 @@ export const register: Register = on => {
     }
 
     // Limits: live if a response reported them, else the last ones seen.
-    const lastLimits = await $.store.get(LIMITS_KEY)
-    const start = usage.rateLimits.length
-      ? copyLimits(usage.rateLimits)
-      : isLimits(lastLimits)
-        ? lastLimits
-        : []
-    await update($, limits, () => start)
+    if (usage.rateLimits.length) {
+      const list = copyLimits(usage.rateLimits)
+      await update($, limits, () => list)
+      await update($, limitsAt, at => at || now)
+    } else {
+      const last = readSavedLimits(await $.store.get(LIMITS_KEY))
+      await update($, limits, l => (l.length ? l : last.list))
+      await update($, limitsAt, at => at || last.at)
+    }
 
     void $.ui.open({ id: PANE, title: TITLE })
-    $.ui.status(line(await read($, totals), start))
+    await showStatus($)
+
+    // Every 2 minutes: redraw the age in the status entry and the pane.
+    $.clock.every(REFRESH_MS, () => {
+      void update($, tick, n => n + 1).then(() => showStatus($))
+    })
+
     return ran
   })
 
@@ -122,18 +167,16 @@ export const register: Register = on => {
     return { text: 'Token usage pane opened.' }
   })
 
-  // Fires after each turn: store the limits and redraw the pane (context
-  // and cost are read live while drawing).
+  // Fires after each turn: new limits arrive with each response.
   on('session.measure', async ($, e, next) => {
-    let list: Limit[]
     if (e.rateLimits.length) {
-      list = copyLimits(e.rateLimits)
+      const list = copyLimits(e.rateLimits)
+      const now = await $.clock.now()
       await update($, limits, () => list)
-      await $.store.set(LIMITS_KEY, list)
-    } else {
-      list = await update($, limits, l => [...l])
+      await update($, limitsAt, () => now)
+      await $.store.set(LIMITS_KEY, { list, at: now })
     }
-    $.ui.status(line(await read($, totals), list))
+    await showStatus($)
     return next(e)
   })
 
@@ -148,7 +191,7 @@ export const register: Register = on => {
         cacheRead: t.cacheRead + u.cache_read_input_tokens,
         cacheWrite: t.cacheWrite + u.cache_creation_input_tokens,
       }))
-      $.ui.status(line(t, await read($, limits)))
+      await showStatus($)
 
       const { startedAt } = await $.session.usage()
       await $.store.set(TOTALS_PREFIX + startedAt, t)
@@ -168,10 +211,11 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
+    await read($, tick) // redraw on the timer, so the age stays current
     const t = await read($, totals)
-    const stored: Limit[] = await read($, limits)
+    const windows: Limit[] = await read($, limits)
+    const when = age(await read($, limitsAt), await $.clock.now())
     const usage = await $.session.usage()
-    const windows = usage.rateLimits.length ? copyLimits(usage.rateLimits) : stored
     const ctx = usage.context
 
     return (
@@ -188,6 +232,11 @@ export const register: Register = on => {
             {l.resetsAt && <Text dimColor>{resets(l.resetsAt)}</Text>}
           </Box>
         ))}
+        {windows.length > 0 && when && (
+          <Text dimColor>
+            Limits as of the last reply ({when}). Settings → Usage has the live figure.
+          </Text>
+        )}
         <Box flexDirection="column">
           <Text bold>
             {fmt(t.input + t.cacheRead + t.cacheWrite)} in · {fmt(t.output)} out

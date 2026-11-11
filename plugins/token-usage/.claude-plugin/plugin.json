@@ -1,6 +1,6 @@
 {
   "name": "token-usage",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "A Token usage pane with your session and weekly plan limits, token counts, context fill and cost",
   "types": "./types/index.d.ts"
 }

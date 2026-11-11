@@ -6,7 +6,7 @@ A personal library (marketplace) of Claude Code mods.
 
 | Mod | What it does |
 | --- | --- |
-| [token-usage](plugins/token-usage) | Opens a **Token usage** pane: current-session and weekly plan limits as bars with reset times, input/output/cache token totals, context fill and session cost. `/tokens` reopens the pane. Under the prompt it pins a compact status entry: Session % · Week % · tokens in · out. |
+| [token-usage](plugins/token-usage) | Opens a **Token usage** pane: current-session and weekly plan limits as bars with reset times, input/output/cache token totals, context fill and session cost. `/tokens` reopens the pane. Under the prompt it pins a compact status entry: Session % · Week % (how long ago they were reported, refreshed every 2 minutes) · tokens in · out. |
 
 ## Install
 
