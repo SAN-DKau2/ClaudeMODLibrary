@@ -1,0 +1,11 @@
+{
+  "name": "ClaudeMODLibrary",
+  "owner": { "name": "SAN-DKau2" },
+  "plugins": [
+    {
+      "name": "token-usage",
+      "source": "./plugins/token-usage",
+      "description": "A Token usage pane with your session and weekly plan limits, token counts, context fill and cost"
+    }
+  ]
+}
